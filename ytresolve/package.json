@@ -1,0 +1,13 @@
+{
+  "name": "ytresolve",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "YouTube video ID → audio stream URL resolver using YouTube.js",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "youtubei.js": "^16.0.1"
+  }
+}

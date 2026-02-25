@@ -41,26 +41,42 @@ The audio stream URL is fetched directly from YouTube's CDN using mobile client 
 
 ytcast-open resolves video IDs to audio streams using YouTube's InnerTube `/player` API with a client fallback chain:
 
-| Priority | Client | Status (Feb 2026) |
+| Priority | Method | Status (Feb 2026) |
 |----------|--------|--------------------|
-| 1 | IOS | 20/20 OK — direct URLs, no sig decryption |
-| 2 | ANDROID | 20/20 OK — direct URLs, no sig decryption |
-| 3 | ANDROID_VR | ~30% OK — LOGIN_REQUIRED on most videos |
-| 4 | TVHTML5_SIMPLY | Untested — no PO token, no SABR, extra fallback |
+| 1 | IOS (local) | 20/20 OK — direct URLs, no sig decryption |
+| 2 | **Remote resolver** | YouTube.js on VPS — full sig decryption, most resilient |
+| 3 | ANDROID (local) | 20/20 OK — direct URLs, no sig decryption |
+| 4 | ANDROID_VR (local) | ~30% OK — LOGIN_REQUIRED on most videos |
+| 5 | TVHTML5_SIMPLY (local) | Untested — no PO token, no SABR, extra fallback |
 
-All clients return direct `url` fields (not `signatureCipher`), so no JavaScript engine or signature decryption is needed.
+Local clients return direct `url` fields (not `signatureCipher`), so no JavaScript engine or signature decryption is needed on the Pi. The remote resolver handles everything including sig decryption when local clients fail.
 
-**Future risk:** YouTube is rolling out PO token requirements and SABR (a new streaming protocol that removes direct URLs). Mobile clients buy time. When they get blocked, the recommended fallback is a **remote stream resolver** — see below.
+## Remote stream resolver
 
-## Remote stream resolver (recommended future-proofing)
+The most resilient stream resolution method is a tiny HTTP API on a server with more RAM. ytcast-open calls it as a fallback when the primary IOS client fails — before trying the other local clients.
 
-If you have access to a server with more RAM (VPS, Hetzner, etc.), the most resilient setup is a tiny HTTP API on that server that resolves video IDs to stream URLs, and ytcast-open calls it as a fallback when all InnerTube clients fail.
+**Set up with two env vars:**
+```bash
+export YTRESOLVE_URL="https://ytresolve.maelo.ca"  # or http://YOUR_SERVER:3033
+export YTRESOLVE_SECRET="your-shared-secret"        # optional auth
+```
 
-**Best option: [YouTube.js](https://github.com/LuanRT/YouTube.js) + [googlevideo](https://github.com/LuanRT/googlevideo) SABR implementation.** This implements YouTube's own new streaming protocol (SABR) rather than trying to work around it. It's more future-proof than yt-dlp because it speaks the protocol YouTube is converging everything to. Needs Node.js/Deno and ~100-200MB RAM — too heavy for a Pi Zero but trivial on a VPS.
+The resolver is a ~30-line Node.js service using [YouTube.js](https://github.com/LuanRT/YouTube.js) (`youtubei.js`). It handles signature decryption, PO tokens, and SABR — everything YouTube throws at it. Needs ~100-200MB RAM, trivial on a VPS but too heavy for a Pi Zero.
 
-Alternative: yt-dlp on the server. Battle-tested, updated within hours of YouTube changes, but it works around YouTube's restrictions rather than implementing them. Needs Python + JS runtime + ~100MB.
+**Why YouTube.js over yt-dlp?** YouTube.js implements YouTube's own protocols (including the new SABR streaming protocol) rather than working around them. It's more future-proof because it speaks the protocol YouTube is converging everything to. yt-dlp works around blocks; YouTube.js implements the actual protocol.
 
-Either way, ytcast-open on the Pi stays at 3.8MB — it just makes one HTTP call to your server instead of calling InnerTube directly.
+**Included:** See `ytresolve/` directory for the Docker-ready resolver service.
+
+```bash
+# Deploy on your VPS
+cd ytresolve
+docker build -t ytresolve .
+docker run -d --name ytresolve -p 3033:3033 \
+  -e YTRESOLVE_SECRET=your-shared-secret \
+  ytresolve
+```
+
+**Without a remote resolver:** ytcast-open works fine standalone — it just uses local InnerTube clients. The remote resolver is insurance for when YouTube blocks mobile clients.
 
 ## Requirements
 
@@ -77,6 +93,10 @@ export DEVICE_NAME="Living Room Pi"
 # MPD connection (defaults: localhost:6600)
 export MPD_HOST=localhost
 export MPD_PORT=6600
+
+# Optional: remote resolver (YouTube.js on your VPS)
+export YTRESOLVE_URL="https://ytresolve.maelo.ca"
+export YTRESOLVE_SECRET="your-shared-secret"
 
 # Run
 ./ytcast-open
@@ -108,7 +128,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `main.rs` | ~750 | Entry point, player command loop, MPD idle events, auto-advance |
 | `lounge.rs` | ~1020 | YouTube Lounge API — session management, streaming long-poll, command parsing |
 | `messages.rs` | ~510 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
-| `innertube.rs` | ~310 | InnerTube stream resolver — IOS/ANDROID/ANDROID_VR/TVHTML5_SIMPLY fallback chain |
+| `innertube.rs` | ~360 | Stream resolver — IOS → remote (YouTube.js) → ANDROID → VR → TV fallback chain |
 | `mpd.rs` | ~340 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~100 | SSDP multicast discovery responder |
 | `dial.rs` | ~120 | DIAL HTTP server on port 8008 |
@@ -124,7 +144,7 @@ Single-threaded tokio runtime. Two MPD TCP connections (command + idle). One lon
 | Binary/install | **2.4MB** single binary | 38MB node_modules | Python + yt-dlp + JS runtime |
 | Startup | ~50ms | ~2s | 2-5s per video |
 | Runtime deps | None | Node.js 18+ | Python 3, QuickJS/Deno/Node |
-| Sig decryption | Not needed (mobile clients) | YouTube.js (66MB import) | Built-in JS interpreter |
+| Sig decryption | Not needed locally; remote resolver handles it | YouTube.js (66MB import) | Built-in JS interpreter |
 
 ## Credits
 

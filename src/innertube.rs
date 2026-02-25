@@ -2,6 +2,19 @@ use serde_json::{json, Value};
 
 const INNERTUBE_URL: &str = "https://www.youtube.com/youtubei/v1/player";
 
+/// Remote resolver URL (YouTube.js on Hetzner). Set via YTRESOLVE_URL env var.
+/// Example: "https://ytresolve.maelo.ca" or "http://46.224.156.225:3033"
+static REMOTE_URL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+static REMOTE_SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn remote_url() -> &'static Option<String> {
+    REMOTE_URL.get_or_init(|| std::env::var("YTRESOLVE_URL").ok().filter(|s| !s.is_empty()))
+}
+
+fn remote_secret() -> &'static str {
+    REMOTE_SECRET.get_or_init(|| std::env::var("YTRESOLVE_SECRET").unwrap_or_default())
+}
+
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // ---------------------------------------------------------------------------
@@ -187,31 +200,92 @@ pub struct StreamInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Remote resolver (YouTube.js on Hetzner)
+// ---------------------------------------------------------------------------
+
+/// Call a remote YouTube.js resolver. Returns None if not configured or on error.
+async fn try_remote(client: &reqwest::Client, video_id: &str) -> Option<StreamInfo> {
+    let base_url = remote_url().as_deref()?;
+    let url = format!("{}/resolve/{}", base_url.trim_end_matches('/'), video_id);
+
+    let mut req = client.get(&url).timeout(std::time::Duration::from_secs(10));
+    let secret = remote_secret();
+    if !secret.is_empty() {
+        req = req.header("x-ytresolve-secret", secret);
+    }
+
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[stream] remote resolver error: {e}");
+            return None;
+        }
+    };
+
+    if !res.status().is_success() {
+        tracing::warn!("[stream] remote resolver {} for {video_id}", res.status());
+        return None;
+    }
+
+    let data: Value = match res.json().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("[stream] remote resolver parse error: {e}");
+            return None;
+        }
+    };
+
+    let stream_url = data["url"].as_str()?;
+    let title = data["title"].as_str().unwrap_or(video_id).to_owned();
+    let duration = data["duration"].as_u64().unwrap_or(0);
+
+    tracing::info!("[stream] resolved {video_id} via remote resolver");
+    Some(StreamInfo {
+        title,
+        duration,
+        stream_url: stream_url.to_owned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Resolver
 // ---------------------------------------------------------------------------
 
-/// Resolve a playable audio stream URL via InnerTube.
+/// Resolve a playable audio stream URL.
 ///
-/// Tries IOS → ANDROID → ANDROID_VR → TVHTML5_SIMPLY in order. All return
-/// direct URLs (no signature decryption needed). Returns `Ok(None)` when
-/// no client can provide a playable stream.
+/// Fallback chain: IOS → remote resolver (Hetzner) → ANDROID → ANDROID_VR
+/// → TVHTML5_SIMPLY. The remote resolver uses YouTube.js with full sig
+/// decryption — most resilient but requires a server. Local InnerTube
+/// clients return direct URLs with no sig decryption needed.
+///
+/// The remote resolver is only tried if YTRESOLVE_URL is set.
 pub async fn resolve_stream(
     client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
     playlist_id: Option<&str>,
 ) -> Result<Option<StreamInfo>> {
-    let clients = [
-        ios_client(video_id, ctt, playlist_id),
+    // 1. Try IOS first (fastest, works locally, 20/20 as of Feb 2026)
+    let ios = ios_client(video_id, ctt, playlist_id);
+    if let Some(info) = try_client(client, video_id, &ios).await? {
+        return Ok(Some(info));
+    }
+
+    // 2. Try remote resolver (YouTube.js on Hetzner — full sig decryption)
+    if let Some(info) = try_remote(client, video_id).await {
+        return Ok(Some(info));
+    }
+
+    // 3. Remaining local fallbacks
+    let fallbacks = [
         android_client(video_id, ctt, playlist_id),
         android_vr_client(video_id, ctt, playlist_id),
         tv_simply_client(video_id, ctt, playlist_id),
     ];
 
-    for identity in &clients {
-        match try_client(client, video_id, identity).await? {
-            Some(info) => return Ok(Some(info)),
-            None => continue,
+    for identity in &fallbacks {
+        if let Some(info) = try_client(client, video_id, identity).await? {
+            return Ok(Some(info));
         }
     }
 
