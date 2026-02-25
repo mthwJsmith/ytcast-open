@@ -87,6 +87,33 @@ const WEB_REMIX_CLIENT: InnerTubeClient = InnerTubeClient {
 };
 
 // ---------------------------------------------------------------------------
+// PoToken (Proof of Origin) — fetched from bgutil-pot sidecar
+// ---------------------------------------------------------------------------
+
+/// Fetch a PoToken from the bgutil-pot HTTP server (localhost:4416).
+/// Returns None if the server isn't running or fails.
+async fn fetch_po_token(http: &reqwest::Client, video_id: &str) -> Option<String> {
+    let body = serde_json::json!({ "content_binding": video_id });
+    let resp = http
+        .post("http://127.0.0.1:4416/get_pot")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        tracing::warn!("[sabr] bgutil-pot returned HTTP {}", resp.status());
+        return None;
+    }
+
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let token = json["poToken"].as_str()?.to_owned();
+    tracing::info!("[sabr] got PoToken for {} ({}...)", video_id, &token[..token.len().min(20)]);
+    Some(token)
+}
+
+// ---------------------------------------------------------------------------
 // InnerTube /player response data
 // ---------------------------------------------------------------------------
 
@@ -116,6 +143,7 @@ async fn innertube_player(
     video_id: &str,
     itclient: &InnerTubeClient,
     ctt: Option<&str>,
+    po_token: Option<&str>,
 ) -> Result<PlayerData, SabrError> {
     let mut client_obj = serde_json::json!({
         "clientName": itclient.client_name,
@@ -147,12 +175,18 @@ async fn innertube_player(
         });
     }
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "videoId": video_id,
         "context": context,
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
+
+    if let Some(pot) = po_token {
+        body["serviceIntegrityDimensions"] = serde_json::json!({
+            "poToken": pot,
+        });
+    }
 
     // WEB_REMIX uses music.youtube.com, others use www.youtube.com.
     let is_web_remix = itclient.client_name == "WEB_REMIX";
@@ -275,29 +309,37 @@ async fn innertube_player(
     })
 }
 
-/// Call InnerTube /player, trying IOS first then falling back to ANDROID.
+/// Call InnerTube /player, trying WEB_REMIX+ctt first, then IOS/ANDROID fallback.
+/// Also fetches a PoToken from bgutil-pot if available.
 async fn get_player_data(
     http: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
-) -> Result<PlayerData, SabrError> {
+) -> Result<(PlayerData, Option<String>), SabrError> {
+    // Fetch PoToken from bgutil-pot sidecar (non-blocking — returns None if unavailable).
+    let po_token = fetch_po_token(http, video_id).await;
+    if po_token.is_some() {
+        tracing::info!("[sabr] using PoToken for /player + SABR");
+    }
+
     // When ctt is available (cast session with YTM Premium), use WEB_REMIX
     // which is the only client that accepts credentialTransferTokens.
     // Fall back to IOS -> ANDROID when no ctt.
     if ctt.is_some() {
-        match innertube_player(http, video_id, &WEB_REMIX_CLIENT, ctt).await {
-            Ok(data) => return Ok(data),
+        match innertube_player(http, video_id, &WEB_REMIX_CLIENT, ctt, po_token.as_deref()).await {
+            Ok(data) => return Ok((data, po_token)),
             Err(e) => {
                 tracing::warn!("[sabr] WEB_REMIX+ctt failed: {}, trying without ctt", e);
             }
         }
     }
 
-    match innertube_player(http, video_id, &IOS_CLIENT, None).await {
-        Ok(data) => Ok(data),
+    match innertube_player(http, video_id, &IOS_CLIENT, None, po_token.as_deref()).await {
+        Ok(data) => Ok((data, po_token)),
         Err(e) => {
             tracing::warn!("[sabr] IOS client failed: {}, trying ANDROID", e);
-            innertube_player(http, video_id, &ANDROID_CLIENT, None).await
+            let data = innertube_player(http, video_id, &ANDROID_CLIENT, None, po_token.as_deref()).await?;
+            Ok((data, po_token))
         }
     }
 }
@@ -377,6 +419,7 @@ struct SabrState {
     sabr_contexts_discard: std::collections::HashSet<i32>,
     ustreamer_config: Vec<u8>,
     client_config: &'static InnerTubeClient,
+    po_token: Option<Vec<u8>>,
     done: bool,
 }
 
@@ -419,6 +462,7 @@ impl SabrState {
             sabr_contexts_discard: std::collections::HashSet::new(),
             ustreamer_config,
             client_config,
+            po_token: None,
             done: false,
         }
     }
@@ -456,6 +500,7 @@ impl SabrState {
 
         let streamer_context = vs::StreamerContext {
             client_info: Some(client_info),
+            po_token: self.po_token.clone(),
             playback_cookie: self.playback_cookie.clone(),
             sabr_contexts: sabr_ctxs,
             ..Default::default()
@@ -882,8 +927,8 @@ pub async fn stream_audio(
     if let Some(token) = ctt {
         tracing::info!("[sabr] stream_audio for {} with ctt={}...", video_id, &token[..token.len().min(20)]);
     }
-    // 1. Call InnerTube /player to get streaming metadata.
-    let player = get_player_data(client, video_id, ctt).await?;
+    // 1. Call InnerTube /player to get streaming metadata (+ PoToken if bgutil-pot is running).
+    let (player, po_token) = get_player_data(client, video_id, ctt).await?;
 
     // 2. Pick the best audio format + a video format for the discard trick.
     let audio_fmt = choose_audio_format(&player.formats)
@@ -927,7 +972,7 @@ pub async fn stream_audio(
     tokio::spawn(async move {
         let result = sabr_loop(
             &http, server_url, &audio_fmt, &video_fmt_clone,
-            ustreamer_config, client_config, &tx,
+            ustreamer_config, client_config, po_token, &tx,
         ).await;
 
         match result {
@@ -952,11 +997,24 @@ async fn sabr_loop(
     video_format: &AdaptiveFormat,
     ustreamer_config: Vec<u8>,
     client_config: &'static InnerTubeClient,
+    po_token: Option<String>,
     tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), SabrError> {
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
     );
+
+    // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
+    if let Some(ref token) = po_token {
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(token) {
+            Ok(bytes) => {
+                tracing::info!("[sabr] PoToken set ({} bytes)", bytes.len());
+                state.po_token = Some(bytes);
+            }
+            Err(e) => tracing::warn!("[sabr] failed to decode PoToken: {}", e),
+        }
+    }
 
     let mut consecutive_errors = 0u32;
     const MAX_RETRIES: u32 = 5;

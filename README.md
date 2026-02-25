@@ -2,7 +2,7 @@
 
 A lightweight YouTube Music cast receiver written in Rust. Makes a Raspberry Pi (or any Linux device) appear as a cast target in YouTube Music. Tap Cast, see your device, play music through MPD.
 
-**3.8MB RAM idle. 2.4MB single binary. Zero runtime dependencies.**
+**3.8MB RAM idle. 2.4MB single binary. One optional sidecar for PoToken.**
 
 Audio streaming powered by [sabr-rs](https://github.com/mthwJsmith/sabr-rs), my Rust implementation of YouTube's SABR protocol.
 
@@ -63,8 +63,9 @@ The SABR code adds roughly 1200 lines of Rust across 3 files. Proto definitions 
 - **MPD** (Music Player Daemon) running and accessible
 - **Linux** (tested on Raspberry Pi Zero 2W with Debian trixie/aarch64)
 - Network access to YouTube servers
+- **Optional: [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs)** for PoToken generation (prevents CDN throttle after 60s). Uses [rustypipe-botguard](https://github.com/tobiashenkel/rustypipe-botguard) internally. Runs as HTTP server on port 4416. ~66MB RAM due to embedded V8 JS engine for BotGuard challenges — can be hosted on a separate machine/VPS to save RAM on the Pi.
 
-That's it. No Node.js, no Python, no external resolvers.
+No Node.js, no Python, no yt-dlp.
 
 ## Usage
 
@@ -111,7 +112,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `ssdp.rs` | ~100 | SSDP multicast discovery responder |
 | `dial.rs` | ~290 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint |
 | `config.rs` | ~50 | JSON config (UUID, screen_id) load/save |
-| `sabr/stream.rs` | ~930 | SABR streaming - InnerTube /player, format selection, SABR request loop, UMP parsing |
+| `sabr/stream.rs` | ~1050 | SABR streaming - InnerTube /player, PoToken fetch, format selection, SABR request loop, UMP parsing |
 | `sabr/ump.rs` | ~320 | UMP binary codec (YouTube's custom varint) + streaming parser + tests |
 | `sabr/mod.rs` | ~12 | Module glue + protobuf includes |
 
@@ -125,10 +126,14 @@ RSS = Resident Set Size (actual physical RAM used by the process).
 |-----------|-----------|
 | ytcast-open idle | ~3.8MB |
 | ytcast-open during SABR streaming | ~5-8MB |
+| bgutil-pot (PoToken sidecar, optional) | ~66MB |
 | MPD | ~10MB |
-| **Total system** | **~15-20MB** |
+| **Total system (without bgutil-pot)** | **~15-20MB** |
+| **Total system (with bgutil-pot)** | **~80-85MB** |
 
 The previous architecture used a Node.js SABR proxy (ytresolve, ~84MB) alongside the Rust binary. That's gone now. All SABR streaming is built into the single binary via [sabr-rs](https://github.com/mthwJsmith/sabr-rs).
+
+The bgutil-pot sidecar generates PoTokens (BotGuard attestation) needed to prevent YouTube's CDN from throttling streams after 60 seconds. It uses ~66MB because it embeds a V8/Deno JavaScript VM to execute Google's BotGuard challenges — this is unfortunately unavoidable as BotGuard requires real JS execution. To save RAM on constrained devices, bgutil-pot can be hosted on a separate machine or VPS and accessed via a single HTTP call.
 
 ## Comparison
 
@@ -145,6 +150,8 @@ The previous architecture used a Node.js SABR proxy (ytresolve, ~84MB) alongside
 
 - [sabr-rs](https://github.com/mthwJsmith/sabr-rs) - our Rust SABR implementation (extracted as a standalone crate)
 - [googlevideo](https://github.com/LuanRT/googlevideo) by LuanRT - TypeScript SABR reference implementation + proto definitions
+- [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs) by jim60105 - Rust PoToken provider (BotGuard attestation)
+- [rustypipe-botguard](https://github.com/tobiashenkel/rustypipe-botguard) - Rust BotGuard challenge solver used by bgutil-pot
 - [yt-cast-receiver](https://github.com/patrickkfkan/yt-cast-receiver) by patrickkfkan - Node.js cast receiver framework (protocol reference)
 - [plaincast](https://github.com/nickvdp/plaincast) - Go cast receiver (Lounge API reference)
 - [ytm-mpd](https://github.com/dgalli1/ytm-mpd) by dgalli1 - original YouTube Cast + MPD bridge
