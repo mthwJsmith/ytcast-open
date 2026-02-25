@@ -132,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         local_ip,
         port: dial_port,
         http_client: http_client.clone(),
+        ctt: std::sync::RwLock::new(None),
     });
 
     // 11. Spawn background tasks
@@ -147,8 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // DIAL HTTP server
     let dial_shutdown = shutdown_rx.clone();
+    let dial_state_server = dial_state.clone();
     tokio::spawn(async move {
-        if let Err(e) = dial::run_dial_server(dial_port, dial_state, dial_shutdown).await {
+        if let Err(e) = dial::run_dial_server(dial_port, dial_state_server, dial_shutdown).await {
             tracing::error!("[DIAL] Error: {}", e);
         }
     });
@@ -262,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &state_tx,
                     &mut playlist,
                     &mut play_started,
+                    &dial_state,
                 ).await {
                     tracing::error!("[player] Error handling command: {}", e);
                 }
@@ -390,6 +393,7 @@ async fn handle_command(
     state_tx: &tokio::sync::mpsc::Sender<messages::OutgoingMessage>,
     playlist: &mut PlaylistState,
     play_started: &mut bool,
+    dial_state: &Arc<dial::DialState>,
 ) -> CmdResult {
     use lounge::PlayerCommand;
 
@@ -412,7 +416,13 @@ async fn handle_command(
             playlist.video_ids = video_ids;
             playlist.current_index = index;
             playlist.list_id = list_id;
-            playlist.ctt = ctt;
+            playlist.ctt = ctt.clone();
+
+            // Store ctt in shared DIAL state so the SABR handler can use it.
+            if let Some(ref token) = ctt {
+                tracing::info!("[player] ctt received: {}", token);
+            }
+            *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
             *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time).await?;
@@ -428,7 +438,12 @@ async fn handle_command(
             playlist.video_ids = vec![video_id.clone()];
             playlist.current_index = 0;
             playlist.list_id.clear();
-            playlist.ctt = ctt;
+            playlist.ctt = ctt.clone();
+
+            if ctt.is_some() {
+                tracing::info!("[player] ctt received from cast session");
+            }
+            *dial_state.ctt.write().unwrap() = ctt;
 
             *play_started = false;
             *play_started = play_video(mpd, http, state_tx, playlist, &video_id, current_time).await?;

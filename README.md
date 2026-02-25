@@ -38,7 +38,7 @@ All audio is streamed using YouTube's **SABR (Server Adaptive Bit Rate) protocol
 Unlike direct URL approaches that break when YouTube changes client policies, SABR is YouTube's own native streaming protocol. It handles format negotiation, server redirects, retries, and backoff automatically.
 
 **Under the hood:**
-1. Raw InnerTube `/player` call (IOS client, falls back to ANDROID)
+1. InnerTube `/player` call using WEB_REMIX client + credential transfer token (ctt) from the cast session for authenticated access. When casting from YouTube Music, the phone sends a per-video ctt automatically — no setup needed. Falls back to IOS/ANDROID clients without ctt (some tracks may be restricted without authentication)
 2. Picks the highest-bitrate Opus audio format
 3. Opens a SABR session with YouTube's CDN using protobuf requests
 4. Parses UMP (Universal Media Protocol) binary response frames
@@ -55,7 +55,8 @@ The SABR code adds roughly 1200 lines of Rust across 3 files. Proto definitions 
 - Playlist support with queue updates mid-session
 - Phone UI stays fully synced (seekbar, album art, controls)
 - Graceful disconnect (stops playback when phone disconnects)
-- Best-quality Opus audio (itag 251, ~128kbps, 48kHz stereo)
+- Best-quality Opus audio (itag 251, up to ~160kbps, 48kHz stereo)
+- Authenticated streaming via cast session credential transfer tokens (WEB_REMIX + ctt)
 
 ## Requirements
 
@@ -92,7 +93,7 @@ cargo build --release
 
 # Cross-compile for Raspberry Pi (aarch64)
 docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
-  "apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu && \
+  "apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu protobuf-compiler && \
    rustup target add aarch64-unknown-linux-gnu && \
    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
    cargo build --release --target aarch64-unknown-linux-gnu"
@@ -105,7 +106,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `main.rs` | ~750 | Entry point, player command loop, MPD idle events, auto-advance |
 | `lounge.rs` | ~1020 | YouTube Lounge API - session management, streaming long-poll, command parsing |
 | `messages.rs` | ~510 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
-| `innertube.rs` | ~70 | Stream resolver - InnerTube /player for metadata + localhost SABR URL |
+| `innertube.rs` | ~150 | Stream resolver - InnerTube /player for metadata (WEB_REMIX+ctt or ANDROID fallback) |
 | `mpd.rs` | ~340 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~100 | SSDP multicast discovery responder |
 | `dial.rs` | ~290 | DIAL HTTP server on port 8008 + `/stream/:videoId` endpoint |

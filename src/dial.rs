@@ -33,6 +33,8 @@ pub struct DialState {
     pub port: u16,
     /// Shared HTTP client for outbound requests (e.g. SABR streaming).
     pub http_client: reqwest::Client,
+    /// Credential transfer token from the casting session (YTM Premium auth).
+    pub ctt: std::sync::RwLock<Option<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +243,8 @@ async fn stream_audio(
         return (StatusCode::BAD_REQUEST, "invalid video id").into_response();
     }
 
-    match crate::sabr::stream::stream_audio(&state.http_client, &video_id).await {
+    let ctt = state.ctt.read().unwrap().clone();
+    match crate::sabr::stream::stream_audio(&state.http_client, &video_id, ctt.as_deref()).await {
         Ok((info, rx)) => {
             // Build streaming response from the mpsc receiver
             let stream =

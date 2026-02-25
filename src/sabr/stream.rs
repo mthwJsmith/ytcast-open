@@ -72,6 +72,20 @@ const ANDROID_CLIENT: InnerTubeClient = InnerTubeClient {
     android_sdk_version: Some(34),
 };
 
+/// YouTube Music web client. Used when ctt (credential transfer token) is
+/// available from a cast session, since IOS/ANDROID reject the ctt with HTTP 400.
+const WEB_REMIX_CLIENT: InnerTubeClient = InnerTubeClient {
+    client_name: "WEB_REMIX",
+    client_version: "1.20241120.01.00",
+    device_make: "",
+    device_model: "",
+    os_name: "",
+    os_version: "",
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    client_name_id: 67,
+    android_sdk_version: None,
+};
+
 // ---------------------------------------------------------------------------
 // InnerTube /player response data
 // ---------------------------------------------------------------------------
@@ -97,49 +111,76 @@ struct AdaptiveFormat {
 // InnerTube /player call
 // ---------------------------------------------------------------------------
 
-const INNERTUBE_PLAYER_URL: &str =
-    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
-
 async fn innertube_player(
     http: &reqwest::Client,
     video_id: &str,
     itclient: &InnerTubeClient,
+    ctt: Option<&str>,
 ) -> Result<PlayerData, SabrError> {
     let mut client_obj = serde_json::json!({
         "clientName": itclient.client_name,
         "clientVersion": itclient.client_version,
-        "deviceMake": itclient.device_make,
-        "deviceModel": itclient.device_model,
-        "osName": itclient.os_name,
-        "osVersion": itclient.os_version,
         "hl": "en",
         "gl": "US",
     });
+
+    // Only include device fields if non-empty (WEB_REMIX doesn't use them).
+    if !itclient.device_make.is_empty() {
+        client_obj["deviceMake"] = serde_json::json!(itclient.device_make);
+        client_obj["deviceModel"] = serde_json::json!(itclient.device_model);
+        client_obj["osName"] = serde_json::json!(itclient.os_name);
+        client_obj["osVersion"] = serde_json::json!(itclient.os_version);
+    }
 
     if let Some(sdk) = itclient.android_sdk_version {
         client_obj["androidSdkVersion"] = serde_json::json!(sdk);
     }
 
+    let mut context = serde_json::json!({ "client": client_obj });
+
+    if let Some(token) = ctt {
+        context["user"] = serde_json::json!({
+            "credentialTransferTokens": [{
+                "scope": "VIDEO",
+                "token": token,
+            }]
+        });
+    }
+
     let body = serde_json::json!({
         "videoId": video_id,
-        "context": { "client": client_obj },
+        "context": context,
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
 
+    // WEB_REMIX uses music.youtube.com, others use www.youtube.com.
+    let is_web_remix = itclient.client_name == "WEB_REMIX";
+    let url = if is_web_remix {
+        "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
+    } else {
+        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+    };
+
     tracing::info!(
-        "[sabr] innertube /player for {} using {}",
+        "[sabr] innertube /player for {} using {}{}",
         video_id,
-        itclient.client_name
+        itclient.client_name,
+        if ctt.is_some() { " +ctt" } else { "" },
     );
 
-    let resp = http
-        .post(INNERTUBE_PLAYER_URL)
+    let mut req = http
+        .post(url)
         .header("User-Agent", itclient.user_agent)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+        .header("Content-Type", "application/json");
+
+    if is_web_remix {
+        req = req
+            .header("Origin", "https://music.youtube.com")
+            .header("Referer", "https://music.youtube.com/");
+    }
+
+    let resp = req.json(&body).send().await?;
 
     if !resp.status().is_success() {
         return Err(format!(
@@ -238,12 +279,25 @@ async fn innertube_player(
 async fn get_player_data(
     http: &reqwest::Client,
     video_id: &str,
+    ctt: Option<&str>,
 ) -> Result<PlayerData, SabrError> {
-    match innertube_player(http, video_id, &IOS_CLIENT).await {
+    // When ctt is available (cast session with YTM Premium), use WEB_REMIX
+    // which is the only client that accepts credentialTransferTokens.
+    // Fall back to IOS -> ANDROID when no ctt.
+    if ctt.is_some() {
+        match innertube_player(http, video_id, &WEB_REMIX_CLIENT, ctt).await {
+            Ok(data) => return Ok(data),
+            Err(e) => {
+                tracing::warn!("[sabr] WEB_REMIX+ctt failed: {}, trying without ctt", e);
+            }
+        }
+    }
+
+    match innertube_player(http, video_id, &IOS_CLIENT, None).await {
         Ok(data) => Ok(data),
         Err(e) => {
             tracing::warn!("[sabr] IOS client failed: {}, trying ANDROID", e);
-            innertube_player(http, video_id, &ANDROID_CLIENT).await
+            innertube_player(http, video_id, &ANDROID_CLIENT, None).await
         }
     }
 }
@@ -451,11 +505,16 @@ impl SabrState {
             selected_format_ids.push(self.audio_format_id.clone());
         }
 
+        // Report player_time_ms close to the buffer end so the server
+        // sees a small buffer and keeps sending segments. With player_time_ms=0
+        // the server sees 60s+ of buffer and throttles to a crawl.
+        let player_time = self.audio_downloaded_ms.saturating_sub(10_000).max(0);
+
         let client_abr_state = vs::ClientAbrState {
             enabled_track_types_bitfield: Some(1), // 1 = audio only
             playback_rate: Some(1.0),
             bandwidth_estimate: Some(5_000_000),
-            player_time_ms: Some(0),
+            player_time_ms: Some(player_time),
             visibility: Some(1),
             player_state: Some(1),
             ..Default::default()
@@ -818,9 +877,13 @@ async fn sabr_request_cycle(
 pub async fn stream_audio(
     client: &reqwest::Client,
     video_id: &str,
+    ctt: Option<&str>,
 ) -> Result<(SabrStreamInfo, mpsc::Receiver<Bytes>), SabrError> {
+    if let Some(token) = ctt {
+        tracing::info!("[sabr] stream_audio for {} with ctt={}...", video_id, &token[..token.len().min(20)]);
+    }
     // 1. Call InnerTube /player to get streaming metadata.
-    let player = get_player_data(client, video_id).await?;
+    let player = get_player_data(client, video_id, ctt).await?;
 
     // 2. Pick the best audio format + a video format for the discard trick.
     let audio_fmt = choose_audio_format(&player.formats)
@@ -845,8 +908,12 @@ pub async fn stream_audio(
         mime_type: audio_fmt.mime_type.clone(),
     };
 
-    // We always use the IOS client config for SABR StreamerContext.
-    let client_config: &'static InnerTubeClient = &IOS_CLIENT;
+    // Use WEB_REMIX for SABR when ctt is available (matches the /player call).
+    let client_config: &'static InnerTubeClient = if ctt.is_some() {
+        &WEB_REMIX_CLIENT
+    } else {
+        &IOS_CLIENT
+    };
 
     // 3. Channel for streaming audio bytes to the caller.
     let (tx, rx) = mpsc::channel::<Bytes>(64);
@@ -893,8 +960,19 @@ async fn sabr_loop(
 
     let mut consecutive_errors = 0u32;
     const MAX_RETRIES: u32 = 5;
+    let mut stall_count = 0u32;
 
     loop {
+        // Check if the downstream consumer (MPD/axum) has disconnected.
+        // Without this, SABR loops run forever when tracks are skipped
+        // because there's no media data to trigger the tx.send() check.
+        if tx.is_closed() {
+            tracing::info!("[sabr] receiver closed, stopping");
+            break;
+        }
+
+        let prev_progress = state.audio_downloaded_ms;
+
         match sabr_request_cycle(http, &mut state, tx).await {
             Ok(should_continue) => {
                 consecutive_errors = 0;
@@ -917,6 +995,21 @@ async fn sabr_loop(
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 continue;
             }
+        }
+
+        // Detect stalls: if the server keeps responding but never sends
+        // new segments, stop after too many fruitless requests.
+        if state.audio_downloaded_ms == prev_progress && prev_progress > 0 {
+            stall_count += 1;
+            if stall_count > 30 {
+                tracing::warn!(
+                    "[sabr] stalled at {}ms for {} requests, giving up",
+                    state.audio_downloaded_ms, stall_count,
+                );
+                break;
+            }
+        } else {
+            stall_count = 0;
         }
 
         // Respect the server-requested backoff before the next request.
