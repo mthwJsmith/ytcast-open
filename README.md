@@ -44,12 +44,10 @@ ytcast-open resolves video IDs to audio streams using YouTube's InnerTube `/play
 | Priority | Method | Status (Feb 2026) |
 |----------|--------|--------------------|
 | 1 | IOS (local) | 20/20 OK — direct URLs, no sig decryption |
-| 2 | **SABR stream** (ytresolve) | Streams audio via YouTube's native SABR protocol — always works |
-| 3 | ANDROID (local) | 20/20 OK — direct URLs, no sig decryption |
-| 4 | ANDROID_VR (local) | ~30% OK — LOGIN_REQUIRED on most videos |
-| 5 | TVHTML5_SIMPLY (local) | Untested — no PO token, no SABR, extra fallback |
+| 2 | ANDROID (local) | 20/20 OK — direct URLs, no sig decryption |
+| 3 | **SABR stream** (ytresolve) | YouTube's native streaming protocol — always works |
 
-Local clients return direct `url` fields (not `signatureCipher`), so no JavaScript engine or signature decryption is needed on the Pi. The SABR fallback uses YouTube's own streaming protocol via the [googlevideo](https://github.com/LuanRT/googlevideo) library — the same protocol the official YouTube app uses.
+Local clients return direct `url` fields (not `signatureCipher`), so no JavaScript engine or signature decryption is needed on the Pi. When direct URLs are unavailable, the SABR fallback uses YouTube's own streaming protocol via the [googlevideo](https://github.com/LuanRT/googlevideo) library — the same protocol the official YouTube app uses. This is the long-term insurance: when YouTube eventually kills direct URLs for all mobile clients, SABR will still work.
 
 ## Remote stream resolver (ytresolve)
 
@@ -149,7 +147,7 @@ docker run --rm -v "$PWD:/src" -w /src rust:1.89-bookworm bash -c \
 | `main.rs` | ~750 | Entry point, player command loop, MPD idle events, auto-advance |
 | `lounge.rs` | ~1020 | YouTube Lounge API — session management, streaming long-poll, command parsing |
 | `messages.rs` | ~510 | Lounge message parsing + `ChunkParser` for HTTP streaming responses |
-| `innertube.rs` | ~360 | Stream resolver — IOS → remote (YouTube.js) → ANDROID → VR → TV fallback chain |
+| `innertube.rs` | ~280 | Stream resolver — IOS → ANDROID → SABR stream fallback chain |
 | `mpd.rs` | ~340 | Raw MPD TCP client (command + idle connections) + mock mode for dev |
 | `ssdp.rs` | ~100 | SSDP multicast discovery responder |
 | `dial.rs` | ~120 | DIAL HTTP server on port 8008 |

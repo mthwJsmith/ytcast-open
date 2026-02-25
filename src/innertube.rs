@@ -25,12 +25,8 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 //
 // ANDROID: Same direct URLs, same coverage. Backup if IOS gets blocked.
 //
-// ANDROID_VR: Was the original client. YouTube started returning
-//   LOGIN_REQUIRED ("Sign in to confirm you're not a bot") on ~70% of
-//   videos as of 25 Feb 2026. Kept as fallback.
-//
-// TVHTML5_SIMPLY: Lightweight TV client. No PO token, no SABR, returns
-//   direct URLs. Untested coverage — added as extra fallback before giving up.
+// If both fail, falls back to SABR streaming via ytresolve (YouTube's own
+// native streaming protocol — always works, future-proof).
 // ---------------------------------------------------------------------------
 
 struct ClientIdentity {
@@ -114,79 +110,6 @@ fn android_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str>) 
     }
 }
 
-fn android_vr_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str>) -> ClientIdentity {
-    let mut context = json!({
-        "client": {
-            "clientName": "ANDROID_VR",
-            "clientVersion": "1.71.26",
-            "androidSdkVersion": 32,
-            "deviceMake": "Oculus",
-            "deviceModel": "Quest 3"
-        }
-    });
-
-    if let Some(token) = ctt {
-        context["user"] = json!({
-            "enableSafetyMode": false,
-            "lockedSafetyMode": false,
-            "credentialTransferTokens": [{
-                "scope": "VIDEO",
-                "token": token
-            }]
-        });
-    }
-
-    let mut payload = json!({
-        "context": context,
-        "videoId": video_id
-    });
-    if let Some(pid) = playlist_id {
-        payload["playlistId"] = json!(pid);
-    }
-
-    ClientIdentity {
-        name: "ANDROID_VR",
-        context: payload,
-        user_agent: "com.google.android.apps.youtube.vr.oculus/1.71.26 \
-            (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-    }
-}
-
-fn tv_simply_client(video_id: &str, ctt: Option<&str>, playlist_id: Option<&str>) -> ClientIdentity {
-    let mut context = json!({
-        "client": {
-            "clientName": "TVHTML5_SIMPLY",
-            "clientVersion": "2.0",
-            "deviceMake": "",
-            "deviceModel": ""
-        }
-    });
-
-    if let Some(token) = ctt {
-        context["user"] = json!({
-            "enableSafetyMode": false,
-            "lockedSafetyMode": false,
-            "credentialTransferTokens": [{
-                "scope": "VIDEO",
-                "token": token
-            }]
-        });
-    }
-
-    let mut payload = json!({
-        "context": context,
-        "videoId": video_id
-    });
-    if let Some(pid) = playlist_id {
-        payload["playlistId"] = json!(pid);
-    }
-
-    ClientIdentity {
-        name: "TVHTML5_SIMPLY",
-        context: payload,
-        user_agent: "Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.5)",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -200,50 +123,49 @@ pub struct StreamInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Remote resolver (YouTube.js on Hetzner)
+// Remote resolver (ytresolve — direct URL + SABR stream fallback)
 // ---------------------------------------------------------------------------
 
-/// Call a remote YouTube.js resolver. Returns None if not configured or on error.
-async fn try_remote(client: &reqwest::Client, video_id: &str) -> Option<StreamInfo> {
-    let base_url = remote_url().as_deref()?;
-    let url = format!("{}/resolve/{}", base_url.trim_end_matches('/'), video_id);
-
-    let mut req = client.get(&url).timeout(std::time::Duration::from_secs(10));
+fn build_remote_request(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+    let mut req = client.get(url).timeout(std::time::Duration::from_secs(10));
     let secret = remote_secret();
     if !secret.is_empty() {
         req = req.header("x-ytresolve-secret", secret);
     }
+    req
+}
 
-    let res = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("[stream] remote resolver error: {e}");
+/// Try /stream/:videoId — SABR audio proxy (always works, future-proof).
+/// Returns a stream URL pointing at the resolver's SABR proxy endpoint.
+async fn try_remote_stream(client: &reqwest::Client, video_id: &str) -> Option<StreamInfo> {
+    let base_url = remote_url().as_deref()?;
+    let stream_url = format!("{}/stream/{}", base_url.trim_end_matches('/'), video_id);
+
+    // Verify the stream endpoint is reachable with a HEAD-like quick check
+    let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+    match build_remote_request(client, &health_url).send().await {
+        Ok(r) if r.status().is_success() => {}
+        _ => {
+            tracing::warn!("[stream] remote SABR resolver unreachable for {video_id}");
             return None;
         }
-    };
-
-    if !res.status().is_success() {
-        tracing::warn!("[stream] remote resolver {} for {video_id}", res.status());
-        return None;
     }
 
-    let data: Value = match res.json().await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("[stream] remote resolver parse error: {e}");
-            return None;
-        }
+    // Build the stream URL with auth header baked in as query param
+    // MPD needs a plain URL it can fetch — we pass the secret as a query param
+    // that the server can also accept (or the URL works as-is if no secret)
+    let secret = remote_secret();
+    let final_url = if !secret.is_empty() {
+        format!("{}?secret={}", stream_url, secret)
+    } else {
+        stream_url
     };
 
-    let stream_url = data["url"].as_str()?;
-    let title = data["title"].as_str().unwrap_or(video_id).to_owned();
-    let duration = data["duration"].as_u64().unwrap_or(0);
-
-    tracing::info!("[stream] resolved {video_id} via remote resolver");
+    tracing::info!("[stream] using SABR stream for {video_id}");
     Some(StreamInfo {
-        title,
-        duration,
-        stream_url: stream_url.to_owned(),
+        title: video_id.to_owned(), // title unknown until stream starts
+        duration: 0,
+        stream_url: final_url,
     })
 }
 
@@ -253,43 +175,36 @@ async fn try_remote(client: &reqwest::Client, video_id: &str) -> Option<StreamIn
 
 /// Resolve a playable audio stream URL.
 ///
-/// Fallback chain: IOS → remote resolver (Hetzner) → ANDROID → ANDROID_VR
-/// → TVHTML5_SIMPLY. The remote resolver uses YouTube.js with full sig
-/// decryption — most resilient but requires a server. Local InnerTube
-/// clients return direct URLs with no sig decryption needed.
+/// Fallback chain:
+///   1. IOS (local)     — direct URLs, fastest, no overhead
+///   2. ANDROID (local) — direct URLs, different client identity
+///   3. SABR stream     — YouTube's native streaming protocol via ytresolve (always works)
 ///
-/// The remote resolver is only tried if YTRESOLVE_URL is set.
+/// The SABR endpoint is only available if YTRESOLVE_URL is set.
 pub async fn resolve_stream(
     client: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
     playlist_id: Option<&str>,
 ) -> Result<Option<StreamInfo>> {
-    // 1. Try IOS first (fastest, works locally, 20/20 as of Feb 2026)
+    // 1. IOS — fastest, works locally
     let ios = ios_client(video_id, ctt, playlist_id);
     if let Some(info) = try_client(client, video_id, &ios).await? {
         return Ok(Some(info));
     }
 
-    // 2. Try remote resolver (YouTube.js on Hetzner — full sig decryption)
-    if let Some(info) = try_remote(client, video_id).await {
+    // 2. ANDROID — backup local client
+    let android = android_client(video_id, ctt, playlist_id);
+    if let Some(info) = try_client(client, video_id, &android).await? {
         return Ok(Some(info));
     }
 
-    // 3. Remaining local fallbacks
-    let fallbacks = [
-        android_client(video_id, ctt, playlist_id),
-        android_vr_client(video_id, ctt, playlist_id),
-        tv_simply_client(video_id, ctt, playlist_id),
-    ];
-
-    for identity in &fallbacks {
-        if let Some(info) = try_client(client, video_id, identity).await? {
-            return Ok(Some(info));
-        }
+    // 3. SABR stream — always works, YouTube's own protocol
+    if let Some(info) = try_remote_stream(client, video_id).await {
+        return Ok(Some(info));
     }
 
-    tracing::error!("[stream] all clients failed for {video_id}");
+    tracing::error!("[stream] all methods failed for {video_id}");
     Ok(None)
 }
 

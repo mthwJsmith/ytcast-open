@@ -113,15 +113,18 @@ async function getSabrData(videoId) {
 const activeStreams = new Map();
 
 const server = http.createServer(async (req, res) => {
-  // Auth check
-  if (SECRET && req.headers['x-ytresolve-secret'] !== SECRET) {
+  // Auth check (header or query param — query param needed for MPD stream URLs)
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const querySecret = url.searchParams.get('secret');
+  if (SECRET && req.headers['x-ytresolve-secret'] !== SECRET && querySecret !== SECRET) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'forbidden' }));
     return;
   }
 
   // GET /resolve/:videoId — returns direct URL (fast, for MPD)
-  const resolveMatch = req.url?.match(/^\/resolve\/([a-zA-Z0-9_-]{11})$/);
+  const pathname = url.pathname;
+  const resolveMatch = pathname.match(/^\/resolve\/([a-zA-Z0-9_-]{11})$/);
   if (resolveMatch) {
     const videoId = resolveMatch[1];
     const start = Date.now();
@@ -146,7 +149,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // GET /stream/:videoId — SABR audio proxy stream
-  const streamMatch = req.url?.match(/^\/stream\/([a-zA-Z0-9_-]{11})$/);
+  const streamMatch = pathname.match(/^\/stream\/([a-zA-Z0-9_-]{11})$/);
   if (streamMatch) {
     const videoId = streamMatch[1];
     const start = Date.now();
@@ -230,7 +233,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // GET /health
-  if (req.url === '/health') {
+  if (pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, active_streams: activeStreams.size }));
     return;
