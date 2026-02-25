@@ -4,7 +4,7 @@ A lightweight YouTube Music cast receiver written in Rust. Makes a Raspberry Pi 
 
 **3.8MB RAM idle. 2.4MB single binary. Zero runtime dependencies.**
 
-Audio streaming powered by [sabr-rs](https://github.com/mthwJsmith/sabr-rs), our Rust implementation of YouTube's SABR protocol.
+Audio streaming powered by [sabr-rs](https://github.com/mthwJsmith/sabr-rs), my Rust implementation of YouTube's SABR protocol.
 
 ## How it works
 
