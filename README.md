@@ -2,7 +2,9 @@
 
 A lightweight YouTube Music cast receiver written in Rust. Makes a Raspberry Pi (or any Linux device) appear as a cast target in YouTube Music. Tap Cast, see your device, play music through MPD.
 
-**3.8MB RSS idle. 2.4MB single binary. Zero runtime dependencies.**
+**3.8MB RAM idle. 2.4MB single binary. Zero runtime dependencies.**
+
+Audio streaming powered by [sabr-rs](https://github.com/mthwJsmith/sabr-rs), our Rust implementation of YouTube's SABR protocol.
 
 ## How it works
 
@@ -116,20 +118,22 @@ Single-threaded tokio runtime. Two MPD TCP connections (command + idle). One lon
 
 ## RAM usage
 
-| Component | RSS |
-|-----------|-----|
-| ytcast-open idle | ~3.8MB |
-| During SABR streaming | ~8-12MB |
-| MPD | ~10MB |
-| **Total** | **~15-25MB** |
+RSS = Resident Set Size (actual physical RAM used by the process).
 
-Compare with the previous Node.js stack (~70MB for the cast receiver + ~84MB for the SABR proxy = ~154MB).
+| Component | RAM (RSS) |
+|-----------|-----------|
+| ytcast-open idle | ~3.8MB |
+| ytcast-open during SABR streaming | ~5-8MB |
+| MPD | ~10MB |
+| **Total system** | **~15-20MB** |
+
+The previous architecture used a Node.js SABR proxy (ytresolve, ~84MB) alongside the Rust binary. That's gone now. All SABR streaming is built into the single binary via [sabr-rs](https://github.com/mthwJsmith/sabr-rs).
 
 ## Comparison
 
 | | ytcast-open (current) | Previous (Rust + Node.js ytresolve) | Typical yt-dlp setup |
 |-|----------------------|-------------------------------------|---------------------|
-| Idle RSS | **~3.8MB** | ~60MB (3.8MB + 55MB Node) | 50-90MB per invocation |
+| Idle RAM | **~3.8MB** | ~60MB (3.8MB + 55MB Node) | 50-90MB per invocation |
 | Binary/install | **2.4MB single binary** | 2.4MB + 2MB node_modules | Python + yt-dlp + JS runtime |
 | Runtime deps | **None** | Node.js 18+ | Python + JS runtime |
 | Startup | ~50ms | ~2s (Node.js) | 2-5s per video |
