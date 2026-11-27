@@ -248,3 +248,36 @@ fn fmt_js_error(ctx: &rquickjs::Ctx<'_>, _e: rquickjs::Error, stage: &str) -> St
         format!("{} failed: {:?}", stage, caught)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::decode_nsig;
+
+    /// Canary: the bundled solver must still handle the player JS that
+    /// youtube.com/tv serves today. Needs network and (first run) ~40s, so it
+    /// is ignored by default: `cargo test -- --ignored solver_handles_live_tv_player`.
+    #[test]
+    #[ignore]
+    fn solver_handles_live_tv_player() {
+        let ua = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
+        let http = reqwest::blocking::Client::new();
+        let get = |url: &str| {
+            http.get(url).header("User-Agent", ua).send().unwrap().text().unwrap()
+        };
+
+        let api = get("https://www.youtube.com/iframe_api");
+        let after = &api[api.find("player\\/").expect("player hash in iframe_api") + "player\\/".len()..];
+        let hash: String = after.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        assert!(hash.len() >= 6, "implausible player hash {:?}", hash);
+
+        let js = get(&format!(
+            "https://www.youtube.com/s/player/{}/tv-player-ias.vflset/tv-player-ias.js",
+            hash
+        ));
+
+        let n = "DI4nsWZGtpSkAiJab4d";
+        let decoded = decode_nsig(&js, n, &hash)
+            .expect("solver should decode n against the live TV player");
+        assert!(!decoded.is_empty() && decoded != n);
+    }
+}
